@@ -1,0 +1,72 @@
+name: copilot-autopilot
+on:
+  push:
+    branches: [main]
+    paths: ['features/**/status.md']
+concurrency:
+  group: copilot-autopilot
+  cancel-in-progress: false
+permissions:
+  contents: write
+  issues: write
+jobs:
+  respond:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install -g @github/copilot
+
+      - name: Find features waiting on Copilot
+        id: find
+        run: |
+          todo=""
+          for f in $(git diff --name-only ${{ github.event.before }} ${{ github.sha }} -- 'features/*/status.md'); do
+            [ -f "$f" ] || continue
+            s=$(tr -d '[:space:]' < "$f")
+            d=$(dirname "$f")
+            if { [ "$s" = needs-input ] || [ "$s" = ready-for-review ]; } && grep -qi '^Auto: *on' "$d/feature.md"; then
+              todo="$todo $d"
+            fi
+          done
+          echo "dirs=$todo" >> "$GITHUB_OUTPUT"
+
+      - name: Run Copilot
+        if: steps.find.outputs.dirs != ''
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
+          GH_TOKEN: ${{ secrets.TARGET_REPOS_PAT }}
+          COPILOT_AUTO_UPDATE: "false"
+        run: |
+          for d in ${{ steps.find.outputs.dirs }}; do
+            copilot -p "$(cat .github/copilot-autopilot.md)
+          Feature folder: $d" -s --no-ask-user \
+              --allow-tool='write' --allow-tool='shell(gh:*)'
+          done
+
+      - name: Commit and push
+        if: steps.find.outputs.dirs != ''
+        run: |
+          git config user.name "copilot-autopilot"
+          git config user.email "copilot-autopilot@users.noreply.github.com"
+          git add features
+          git diff --cached --quiet && exit 0
+          git commit -m "Copilot autopilot:${{ steps.find.outputs.dirs }}"
+          git pull --rebase && git push
+
+      - name: Tell me when I'm needed
+        if: steps.find.outputs.dirs != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for d in ${{ steps.find.outputs.dirs }}; do
+            if [ "$(tr -d '[:space:]' < "$d/status.md")" = needs-human ]; then
+              gh issue create --assignee "ssakoora" \
+                --title "Needs you: $d" \
+                --body "Copilot handed this back. See $d/questions.md and the PRs in $d/results.md."
+            fi
+          done
